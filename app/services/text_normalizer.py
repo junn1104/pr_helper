@@ -49,7 +49,11 @@ class TextNormalizer:
         for token in tokens:
 
             # 문장부호는 분석 어절에서 제외
-            if token.tag.startswith("S"):
+            # 단, SN은 숫자이므로 유지
+            if (
+                token.tag.startswith("S")
+                and token.tag != "SN"
+            ):
                 continue
 
             if previous_end is not None:
