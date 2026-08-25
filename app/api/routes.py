@@ -1,14 +1,29 @@
+import json
 import os
 import tempfile
+import uuid
 import wave
 from pathlib import Path
 
 from fastapi import (
     APIRouter,
+    Depends,
     File,
     HTTPException,
+    Response,
     UploadFile,
 )
+
+from sqlmodel import (
+    Session,
+    select,
+)
+
+from app.api.deps import get_current_device
+from app.core.database import get_session
+
+from app.models.analysis_record import AnalysisRecord
+from app.models.device import Device
 
 from app.schemas.analysis_response import (
     AnalysisResponse,
@@ -16,6 +31,14 @@ from app.schemas.analysis_response import (
 
 from app.services.audio_converter import (
     AudioConverter,
+)
+
+from app.schemas.device_response import (
+    DeviceTokenResponse
+)
+
+from app.schemas.history_response import (
+    HistoryListResponse
 )
 
 from app.services.presentation_analysis_service import (
@@ -100,11 +123,51 @@ def validate_wav(
 
 
 @router.post(
+    "/api/device/register",
+    response_model=DeviceTokenResponse,
+)
+def register_device(
+    session: Session = Depends(
+        get_session
+    ),
+):
+    # 로그인/회원가입 없이 기기(브라우저/앱)를 구분하기 위한
+    # 익명 토큰 발급. 발급받은 토큰은 클라이언트가 로컬에
+    # 저장해두고 이후 모든 요청에 X-Device-Token 헤더로 보낸다.
+
+    device = Device(
+        token=str(
+            uuid.uuid4()
+        )
+    )
+
+    session.add(
+        device
+    )
+
+    session.commit()
+
+    session.refresh(
+        device
+    )
+
+    return {
+        "token": device.token
+    }
+
+
+@router.post(
     "/analyze",
     response_model=AnalysisResponse,
 )
 async def analyze_presentation(
     file: UploadFile = File(...),
+    session: Session = Depends(
+        get_session
+    ),
+    device: Device = Depends(
+        get_current_device
+    ),
 ):
 
     filename = (
@@ -141,6 +204,8 @@ async def analyze_presentation(
 
             total_size = 0
 
+            audio_chunks = []
+
             while True:
                 chunk = await file.read(
                     1024 * 1024
@@ -160,6 +225,10 @@ async def analyze_presentation(
                             "파일 크기는 최대 50MB까지 지원합니다."
                         ),
                     )
+
+                audio_chunks.append(
+                    chunk
+                )
 
                 temp_file.write(
                     chunk
@@ -233,7 +302,7 @@ async def analyze_presentation(
             {},
         )
 
-        return {
+        response_payload = {
             "transcript": (
                 result.get(
                     "transcript",
@@ -351,6 +420,43 @@ async def analyze_presentation(
             ),
         }
 
+        try:
+            record = AnalysisRecord(
+                device_id=device.id,
+                filename=filename,
+                duration=response_payload[
+                    "duration"
+                ],
+                audio_data=b"".join(
+                    audio_chunks
+                ),
+                result_json=json.dumps(
+                    response_payload,
+                    ensure_ascii=False,
+                ),
+                overall_score=risk.get(
+                    "overall_score",
+                    0,
+                ),
+                overall_level=risk.get(
+                    "overall_level",
+                    "low",
+                ),
+            )
+
+            session.add(
+                record
+            )
+
+            session.commit()
+
+        except Exception:
+            # 분석 자체는 성공했으므로, 히스토리 저장이
+            # 실패하더라도 분석 결과는 그대로 응답한다.
+            session.rollback()
+
+        return response_payload
+
     except HTTPException:
         raise
 
@@ -393,3 +499,137 @@ async def analyze_presentation(
                 )
             except OSError:
                 pass
+
+
+def _get_owned_record(
+    record_id: int,
+    session: Session,
+    device: Device,
+) -> AnalysisRecord:
+
+    record = session.exec(
+        select(
+            AnalysisRecord
+        ).where(
+            AnalysisRecord.id == record_id,
+            AnalysisRecord.device_id == device.id,
+        )
+    ).first()
+
+    if record is None:
+        raise HTTPException(
+            status_code=404,
+            detail=(
+                "해당 분석 기록을 찾을 수 없습니다."
+            ),
+        )
+
+    return record
+
+
+@router.get(
+    "/api/history",
+    response_model=HistoryListResponse,
+)
+def list_history(
+    session: Session = Depends(
+        get_session
+    ),
+    device: Device = Depends(
+        get_current_device
+    ),
+):
+    # 마이페이지 목록 조회. 로그인 없이
+    # X-Device-Token으로 본인 기록만 필터링한다.
+
+    records = session.exec(
+        select(
+            AnalysisRecord
+        ).where(
+            AnalysisRecord.device_id == device.id
+        ).order_by(
+            AnalysisRecord.created_at.desc()
+        )
+    ).all()
+
+    return {
+        "items": [
+            {
+                "id": record.id,
+                "filename": record.filename,
+                "duration": record.duration,
+                "overall_score": record.overall_score,
+                "overall_level": record.overall_level,
+                "created_at": record.created_at,
+            }
+            for record in records
+        ]
+    }
+
+
+@router.get(
+    "/api/history/{record_id}",
+    response_model=AnalysisResponse,
+)
+def get_history_detail(
+    record_id: int,
+    session: Session = Depends(
+        get_session
+    ),
+    device: Device = Depends(
+        get_current_device
+    ),
+):
+    # 저장 당시의 분석 결과(AnalysisResponse)를
+    # 그대로 복원해 반환한다.
+
+    record = _get_owned_record(
+        record_id,
+        session,
+        device,
+    )
+
+    return json.loads(
+        record.result_json
+    )
+
+
+@router.get(
+    "/api/history/{record_id}/audio",
+)
+def get_history_audio(
+    record_id: int,
+    session: Session = Depends(
+        get_session
+    ),
+    device: Device = Depends(
+        get_current_device
+    ),
+):
+    # 재생/다시듣기용 원본 오디오. Postgres에는
+    # bytea로, SQLite에는 BLOB으로 저장되어 있다.
+    #
+    # audio_data는 업로드된 원본 그대로(WAV 또는 M4A)
+    # 저장되므로, 저장된 파일 확장자에 맞는 media_type을
+    # 사용해야 한다.
+
+    record = _get_owned_record(
+        record_id,
+        session,
+        device,
+    )
+
+    extension = os.path.splitext(
+        record.filename
+    )[1].lower()
+
+    media_type = (
+        "audio/mp4"
+        if extension == ".m4a"
+        else "audio/wav"
+    )
+
+    return Response(
+        content=record.audio_data,
+        media_type=media_type,
+    )

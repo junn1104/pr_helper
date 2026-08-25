@@ -17,7 +17,10 @@ audio/*
 !audio/.gitkeep
 
 .cache/
-models/
+/models/
+
+# 로컬 개발용 SQLite DB
+*.db
 
 .pytest_cache/
 

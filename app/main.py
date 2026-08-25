@@ -6,6 +6,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from app.api.routes import router
+from app.core.database import init_db
 
 
 app = FastAPI(
@@ -32,6 +33,11 @@ app.add_middleware(
 app.include_router(
     router
 )
+
+
+@app.on_event("startup")
+def on_startup():
+    init_db()
 
 
 @app.get("/")
