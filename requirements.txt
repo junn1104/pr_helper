@@ -4,6 +4,9 @@ python-multipart
 pydantic
 pydantic-settings
 
+sqlmodel
+psycopg2-binary
+
 torch
 torchaudio
 
@@ -15,4 +18,4 @@ numpy
 kiwipiepy
 
 google-genai
-python-dotenvclear
+python-dotenv

@@ -9,6 +9,8 @@ class Settings(BaseSettings):
 
     max_audio_size_mb: int = 100
 
+    database_url: str = "sqlite:///./app.db"
+
     class Config:
         env_file = ".env"
 
