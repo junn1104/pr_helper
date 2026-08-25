@@ -16,3 +16,5 @@ kiwipiepy
 
 google-genai
 python-dotenvclear
+
+imageio-ffmpeg
