@@ -19,3 +19,5 @@ kiwipiepy
 
 google-genai
 python-dotenv
+
+imageio-ffmpeg

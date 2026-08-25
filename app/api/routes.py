@@ -1,9 +1,9 @@
 import json
 import os
-import shutil
 import tempfile
 import uuid
 import wave
+from pathlib import Path
 
 from fastapi import (
     APIRouter,
@@ -26,7 +26,11 @@ from app.models.analysis_record import AnalysisRecord
 from app.models.device import Device
 
 from app.schemas.analysis_response import (
-    AnalysisResponse
+    AnalysisResponse,
+)
+
+from app.services.audio_converter import (
+    AudioConverter,
 )
 
 from app.schemas.device_response import (
@@ -38,7 +42,7 @@ from app.schemas.history_response import (
 )
 
 from app.services.presentation_analysis_service import (
-    PresentationAnalysisService
+    PresentationAnalysisService,
 )
 
 
@@ -49,6 +53,11 @@ presentation_service = None
 
 
 MAX_FILE_SIZE = 50 * 1024 * 1024
+
+ALLOWED_EXTENSIONS = {
+    ".wav",
+    ".m4a",
+}
 
 
 def get_presentation_service():
@@ -170,23 +179,26 @@ async def analyze_presentation(
         filename
     )[1].lower()
 
-    if extension != ".wav":
+    if extension not in ALLOWED_EXTENSIONS:
         raise HTTPException(
             status_code=400,
             detail=(
-                "현재는 WAV 파일만 지원합니다."
+                "현재는 WAV, M4A 파일만 지원합니다."
             ),
         )
 
-    temp_path = None
+    original_temp_path = None
+    converted_wav_path = None
 
     try:
+        # 업로드된 원본 확장자를 그대로 유지해서
+        # 임시 파일로 저장
         with tempfile.NamedTemporaryFile(
             delete=False,
-            suffix=".wav",
+            suffix=extension,
         ) as temp_file:
 
-            temp_path = (
+            original_temp_path = (
                 temp_file.name
             )
 
@@ -230,8 +242,46 @@ async def analyze_presentation(
                 ),
             )
 
+        # 분석에 실제로 사용할 WAV 경로
+        analysis_path = (
+            original_temp_path
+        )
+
+        # M4A인 경우 WAV로 변환
+        if extension == ".m4a":
+
+            with tempfile.NamedTemporaryFile(
+                delete=False,
+                suffix=".wav",
+            ) as wav_temp_file:
+
+                converted_wav_path = (
+                    wav_temp_file.name
+                )
+
+            try:
+                AudioConverter.convert_to_wav(
+                    original_temp_path,
+                    converted_wav_path,
+                )
+
+            except Exception as e:
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        "M4A 파일을 WAV로 변환하는 중 "
+                        f"오류가 발생했습니다: {str(e)}"
+                    ),
+                )
+
+            analysis_path = (
+                converted_wav_path
+            )
+
+        # WAV 자체 업로드 또는
+        # M4A → WAV 변환 결과 검증
         validate_wav(
-            temp_path
+            analysis_path
         )
 
         service = (
@@ -239,7 +289,7 @@ async def analyze_presentation(
         )
 
         result = service.analyze(
-            temp_path
+            analysis_path
         )
 
         speech = result.get(
@@ -425,14 +475,27 @@ async def analyze_presentation(
             pass
 
         if (
-            temp_path
+            original_temp_path
             and os.path.exists(
-                temp_path
+                original_temp_path
             )
         ):
             try:
                 os.remove(
-                    temp_path
+                    original_temp_path
+                )
+            except OSError:
+                pass
+
+        if (
+            converted_wav_path
+            and os.path.exists(
+                converted_wav_path
+            )
+        ):
+            try:
+                os.remove(
+                    converted_wav_path
                 )
             except OSError:
                 pass
@@ -545,6 +608,10 @@ def get_history_audio(
 ):
     # 재생/다시듣기용 원본 오디오. Postgres에는
     # bytea로, SQLite에는 BLOB으로 저장되어 있다.
+    #
+    # audio_data는 업로드된 원본 그대로(WAV 또는 M4A)
+    # 저장되므로, 저장된 파일 확장자에 맞는 media_type을
+    # 사용해야 한다.
 
     record = _get_owned_record(
         record_id,
@@ -552,7 +619,17 @@ def get_history_audio(
         device,
     )
 
+    extension = os.path.splitext(
+        record.filename
+    )[1].lower()
+
+    media_type = (
+        "audio/mp4"
+        if extension == ".m4a"
+        else "audio/wav"
+    )
+
     return Response(
         content=record.audio_data,
-        media_type="audio/wav",
+        media_type=media_type,
     )
